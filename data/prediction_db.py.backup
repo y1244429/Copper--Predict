@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+铜价预测结果数据库存储模块
+支持将预测结果保存到SQLite数据库
+"""
+
+import sqlite3
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional
+import json
+
+
+class PredictionDatabase:
+    """预测结果数据库管理器"""
+    
+    def __init__(self, db_path: str = None):
+        """
+        初始化数据库连接
+        
+        Args:
+            db_path: 数据库文件路径，默认为项目目录下的 predictions.db
+        """
+        if db_path is None:
+            project_dir = Path(__file__).parent
+            db_path = project_dir / "data" / "predictions.db"
+        
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 初始化数据库表
+        self._init_tables()
+    
+    def _get_connection(self) -> sqlite3.Connection:
+        """获取数据库连接"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row  # 允许通过列名访问
+        return conn
+    
+    def _init_tables(self):
+        """初始化数据库表结构"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        # 1. 预测结果主表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prediction_date TEXT NOT NULL UNIQUE,  -- 预测日期（主键）
+                run_time TEXT NOT NULL,                 -- 运行时间
+                current_price REAL,                     -- 当前价格
+                xgboost_5day REAL,                      -- XGBoost 5天预测
+                xgboost_10day REAL,                     -- XGBoost 10天预测
+                xgboost_20day REAL,                     -- XGBoost 20天预测
+                macro_1month REAL,                      -- 宏观模型1个月预测
+                macro_3month REAL,                      -- 宏观模型3个月预测
+                macro_6month REAL,                      -- 宏观模型6个月预测
+                fundamental_6month REAL,                -- 基本面模型6个月预测
+                lstm_5day REAL,                         -- LSTM 5天预测
+                lstm_10day REAL,                        -- LSTM 10天预测
+                lstm_5day_return REAL,                  -- LSTM 5天预测返回率
+                lstm_10day_return REAL,                 -- LSTM 10天预测返回率
+                comex_open REAL,                        -- Comex开盘价
+                comex_high REAL,                        -- Comex最高价
+                comex_low REAL,                         -- Comex最低价
+                comex_close REAL,                       -- Comex收盘价
+                comex_volume INTEGER,                    -- Comex成交量
+                overall_trend TEXT,                     -- 总体趋势
+                confidence REAL,                        -- 置信度
+                risk_level TEXT,                        -- 风险等级
+                notes TEXT,                             -- 备注
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # 添加新字段（如果表已存在）
+        try:
+            cursor.execute('ALTER TABLE predictions ADD COLUMN lstm_5day_return REAL')
+        except sqlite3.OperationalError:
+            pass  # 字段已存在
+
+        try:
+            cursor.execute('ALTER TABLE predictions ADD COLUMN lstm_10day_return REAL')
+        except sqlite3.OperationalError:
+            pass  # 字段已存在
+
+        try:
+            cursor.execute('ALTER TABLE predictions ADD COLUMN comex_open REAL')
+        except sqlite3.OperationalError:
+            pass  # 字段已存在
+
+        try:
+            cursor.execute('ALTER TABLE predictions ADD COLUMN comex_high REAL')
+        except sqlite3.OperationalError:
+            pass  # 字段已存在
+
+        try:
+            cursor.execute('ALTER TABLE predictions ADD COLUMN comex_low REAL')
+        except sqlite3.OperationalError:
+            pass  # 字段已存在
+
+        try:
+            cursor.execute('ALTER TABLE predictions ADD COLUMN comex_close REAL')
+        except sqlite3.OperationalError:
+            pass  # 字段已存在
+
+        try:
+            cursor.execute('ALTER TABLE predictions ADD COLUMN comex_volume INTEGER')
+        except sqlite3.OperationalError:
+            pass  # 字段已存在
+
+        try:
+            cursor.execute('ALTER TABLE predictions ADD COLUMN comex_volatility REAL')
+        except sqlite3.OperationalError:
+            pass  # 字段已存在
+
+        # 2. 技术指标表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS technical_indicators (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prediction_date TEXT NOT NULL,
+                ma5 REAL,
+                ma10 REAL,
+                ma20 REAL,
+                ma60 REAL,
+                rsi REAL,
+                macd REAL,
+                macd_signal REAL,
+                volume_ratio REAL,
+                support_level REAL,
+                resistance_level REAL,
+                FOREIGN KEY (prediction_date) REFERENCES predictions(prediction_date) ON DELETE CASCADE
+            )
+        ''')
+        
+        # 3. 宏观因子表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS macro_factors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prediction_date TEXT NOT NULL,
+                usd_index REAL,
+                dollar_trend TEXT,
+                vix REAL,
+                vix_trend TEXT,
+                china_pmi REAL,
+                china_pmi_trend TEXT,
+                us_pmi REAL,
+                us_pmi_trend TEXT,
+                oil_price REAL,
+                gold_price REAL,
+                global_demand TEXT,
+                FOREIGN KEY (prediction_date) REFERENCES predictions(prediction_date) ON DELETE CASCADE
+            )
+        ''')
+        
+        # 4. 模型评估表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS model_performance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prediction_date TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                accuracy REAL,
+                mae REAL,
+                rmse REAL,
+                r2_score REAL,
+                FOREIGN KEY (prediction_date) REFERENCES predictions(prediction_date) ON DELETE CASCADE
+            )
+        ''')
+        
+        # 5. 预测详情JSON表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS prediction_details (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prediction_date TEXT NOT NULL,
+                detail_type TEXT NOT NULL,  -- 'xgboost', 'macro', 'fundamental', 'lstm'
+                detail_json TEXT,           -- JSON格式存储详细预测结果
+                FOREIGN KEY (prediction_date) REFERENCES predictions(prediction_date) ON DELETE CASCADE
+            )
+        ''')
+        
+        # 创建索引
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_prediction_date ON predictions(prediction_date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_run_time ON predictions(run_time)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tech_date ON technical_indicators(prediction_date)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_macro_date ON macro_factors(prediction_date)')
+        
+        conn.commit()
+        conn.close()
+        
+        print(f"✓ 数据库初始化完成: {self.db_path}")
+    
+    def save_prediction(self, prediction_data: Dict) -> bool:
+        """
+        保存预测结果
+        
+        Args:
+            prediction_data: 预测数据字典，格式见下文示例
+        
+        Returns:
+            bool: 是否保存成功
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            # 解析预测日期
+            prediction_date = prediction_data.get('prediction_date', 
+                datetime.now().strftime('%Y-%m-%d'))
+            run_time = prediction_data.get('run_time',
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            
+            # 检查是否已存在该日期的预测
+            cursor.execute('SELECT id FROM predictions WHERE prediction_date = ?', (prediction_date,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                # 更新现有记录
+                print(f"✓ 更新预测结果: {prediction_date}")
+                cursor.execute('''
+                    UPDATE predictions SET
+                        run_time = ?,
+                        current_price = ?,
+                        xgboost_5day = ?,
+                        xgboost_10day = ?,
+                        xgboost_20day = ?,
+                        macro_1month = ?,
+                        macro_3month = ?,
+                        macro_6month = ?,
+                        fundamental_6month = ?,
+                        lstm_5day = ?,
+                        lstm_10day = ?,
+                        lstm_5day_return = ?,
+                        lstm_10day_return = ?,
+                        comex_open = ?,
+                        comex_high = ?,
+                        comex_low = ?,
+                        comex_close = ?,
+                        comex_volume = ?,
+                        comex_volatility = ?,
+                        overall_trend = ?,
+                        confidence = ?,
+                        risk_level = ?,
+                        notes = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE prediction_date = ?
+                ''', (
+                    run_time,
+                    prediction_data.get('current_price'),
+                    prediction_data.get('xgboost_5day'),
+                    prediction_data.get('xgboost_10day'),
+                    prediction_data.get('xgboost_20day'),
+                    prediction_data.get('macro_1month'),
+                    prediction_data.get('macro_3month'),
+                    prediction_data.get('macro_6month'),
+                    prediction_data.get('fundamental_6month'),
+                    prediction_data.get('lstm_5day'),
+                    prediction_data.get('lstm_10day'),
+                    prediction_data.get('lstm_5day_return'),
+                    prediction_data.get('lstm_10day_return'),
+                    prediction_data.get('comex_open'),
+                    prediction_data.get('comex_high'),
+                    prediction_data.get('comex_low'),
+                    prediction_data.get('comex_close'),
+                    prediction_data.get('comex_volume'),
+                    prediction_data.get('comex_volatility'),
+                    prediction_data.get('overall_trend'),
+                    prediction_data.get('confidence'),
+                    prediction_data.get('risk_level'),
+                    prediction_data.get('notes'),
+                    prediction_date
+                ))
+
+                # 删除旧的相关数据
+                cursor.execute('DELETE FROM technical_indicators WHERE prediction_date = ?', (prediction_date,))
+                cursor.execute('DELETE FROM macro_factors WHERE prediction_date = ?', (prediction_date,))
+                cursor.execute('DELETE FROM model_performance WHERE prediction_date = ?', (prediction_date,))
+                cursor.execute('DELETE FROM prediction_details WHERE prediction_date = ?', (prediction_date,))
+
+            else:
+                # 插入新记录
+                print(f"✓ 保存新预测结果: {prediction_date}")
+                cursor.execute('''
+                    INSERT INTO predictions (
+                        prediction_date, run_time, current_price,
+                        xgboost_5day, xgboost_10day, xgboost_20day,
+                        macro_1month, macro_3month, macro_6month,
+                        fundamental_6month, lstm_5day, lstm_10day,
+                        lstm_5day_return, lstm_10day_return,
+                        comex_open, comex_high, comex_low, comex_close, comex_volume, comex_volatility,
+                        overall_trend, confidence, risk_level, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    prediction_date,
+                    run_time,
+                    prediction_data.get('current_price'),
+                    prediction_data.get('xgboost_5day'),
+                    prediction_data.get('xgboost_10day'),
+                    prediction_data.get('xgboost_20day'),
+                    prediction_data.get('macro_1month'),
+                    prediction_data.get('macro_3month'),
+                    prediction_data.get('macro_6month'),
+                    prediction_data.get('fundamental_6month'),
+                    prediction_data.get('lstm_5day'),
+                    prediction_data.get('lstm_10day'),
+                    prediction_data.get('lstm_5day_return'),
+                    prediction_data.get('lstm_10day_return'),
+                    prediction_data.get('comex_open'),
+                    prediction_data.get('comex_high'),
+                    prediction_data.get('comex_low'),
+                    prediction_data.get('comex_close'),
+                    prediction_data.get('comex_volume'),
+                    prediction_data.get('comex_volatility'),
+                    prediction_data.get('overall_trend'),
+                    prediction_data.get('confidence'),
+                    prediction_data.get('risk_level'),
+                    prediction_data.get('notes')
+                ))
+            
+            # 保存技术指标
+            if 'technical_indicators' in prediction_data:
+                tech_data = prediction_data['technical_indicators']
+                cursor.execute('''
+                    INSERT INTO technical_indicators (
+                        prediction_date, ma5, ma10, ma20, ma60,
+                        rsi, macd, macd_signal, volume_ratio,
+                        support_level, resistance_level
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    prediction_date,
+                    tech_data.get('ma5'),
+                    tech_data.get('ma10'),
+                    tech_data.get('ma20'),
+                    tech_data.get('ma60'),
+                    tech_data.get('rsi'),
+                    tech_data.get('macd'),
+                    tech_data.get('macd_signal'),
+                    tech_data.get('volume_ratio'),
+                    tech_data.get('support_level'),
+                    tech_data.get('resistance_level')
+                ))
+            
+            # 保存宏观因子
+            if 'macro_factors' in prediction_data:
+                macro_data = prediction_data['macro_factors']
+                cursor.execute('''
+                    INSERT INTO macro_factors (
+                        prediction_date, usd_index, dollar_trend, vix, vix_trend,
+                        china_pmi, china_pmi_trend, us_pmi, us_pmi_trend,
+                        oil_price, gold_price, global_demand
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    prediction_date,
+                    macro_data.get('usd_index'),
+                    macro_data.get('dollar_trend'),
+                    macro_data.get('vix'),
+                    macro_data.get('vix_trend'),
+                    macro_data.get('china_pmi'),
+                    macro_data.get('china_pmi_trend'),
+                    macro_data.get('us_pmi'),
+                    macro_data.get('us_pmi_trend'),
+                    macro_data.get('oil_price'),
+                    macro_data.get('gold_price'),
+                    macro_data.get('global_demand')
+                ))
+            
+            # 保存模型性能
+            if 'model_performance' in prediction_data:
+                for model_name, perf in prediction_data['model_performance'].items():
+                    cursor.execute('''
+                        INSERT INTO model_performance (
+                            prediction_date, model_name, accuracy, mae, rmse, r2_score
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (
+                        prediction_date,
+                        model_name,
+                        perf.get('accuracy'),
+                        perf.get('mae'),
+                        perf.get('rmse'),
+                        perf.get('r2_score')
+                    ))
+            
+            # 保存详细预测结果
+            if 'prediction_details' in prediction_data:
+                for detail_type, detail_json in prediction_data['prediction_details'].items():
+                    cursor.execute('''
+                        INSERT INTO prediction_details (prediction_date, detail_type, detail_json)
+                        VALUES (?, ?, ?)
+                    ''', (
+                        prediction_date,
+                        detail_type,
+                        json.dumps(detail_json, ensure_ascii=False)
+                    ))
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"✓ 预测结果已保存到数据库: {prediction_date}")
+            return True
+            
+        except Exception as e:
+            print(f"✗ 保存预测结果失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def get_prediction(self, prediction_date: str) -> Optional[Dict]:
+        """
+        获取指定日期的预测结果
+        
+        Args:
+            prediction_date: 预测日期 (YYYY-MM-DD)
+        
+        Returns:
+            预测数据字典，如果不存在则返回None
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM predictions WHERE prediction_date = ?', (prediction_date,))
+        row = cursor.fetchone()
+        
+        if not row:
+            conn.close()
+            return None
+        
+        result = dict(row)
+        
+        # 获取技术指标
+        cursor.execute('SELECT * FROM technical_indicators WHERE prediction_date = ?', (prediction_date,))
+        tech_row = cursor.fetchone()
+        if tech_row:
+            result['technical_indicators'] = dict(tech_row)
+        
+        # 获取宏观因子
+        cursor.execute('SELECT * FROM macro_factors WHERE prediction_date = ?', (prediction_date,))
+        macro_row = cursor.fetchone()
+        if macro_row:
+            result['macro_factors'] = dict(macro_row)
+        
+        # 获取模型性能
+        cursor.execute('SELECT * FROM model_performance WHERE prediction_date = ?', (prediction_date,))
+        perf_rows = cursor.fetchall()
+        if perf_rows:
+            result['model_performance'] = {row['model_name']: dict(row) for row in perf_rows}
+        
+        conn.close()
+        return result
+    
+    def get_all_predictions(self, limit: int = None, 
+                            start_date: str = None, 
+                            end_date: str = None) -> List[Dict]:
+        """
+        获取所有预测结果
+        
+        Args:
+            limit: 返回记录数量限制
+            start_date: 开始日期 (YYYY-MM-DD)
+            end_date: 结束日期 (YYYY-MM-DD)
+        
+        Returns:
+            预测数据列表
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        query = 'SELECT * FROM predictions WHERE 1=1'
+        params = []
+        
+        if start_date:
+            query += ' AND prediction_date >= ?'
+            params.append(start_date)
+        
+        if end_date:
+            query += ' AND prediction_date <= ?'
+            params.append(end_date)
+        
+        query += ' ORDER BY prediction_date DESC'
+        
+        if limit:
+            query += ' LIMIT ?'
+            params.append(limit)
+        
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        
+        conn.close()
+        return [dict(row) for row in rows]
+    
+    def get_latest_prediction(self) -> Optional[Dict]:
+        """获取最新的预测结果"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT * FROM predictions ORDER BY prediction_date DESC LIMIT 1')
+        row = cursor.fetchone()
+        
+        conn.close()
+        
+        if row:
+            return dict(row)
+        return None
+    
+    def export_to_csv(self, output_path: str = None, 
+                      start_date: str = None, 
+                      end_date: str = None) -> str:
+        """
+        导出预测结果到CSV
+        
+        Args:
+            output_path: 输出文件路径
+            start_date: 开始日期
+            end_date: 结束日期
+        
+        Returns:
+            输出文件路径
+        """
+        import pandas as pd
+        
+        predictions = self.get_all_predictions(start_date=start_date, end_date=end_date)
+        
+        if not predictions:
+            raise ValueError("没有可导出的数据")
+        
+        df = pd.DataFrame(predictions)
+        
+        if output_path is None:
+            output_path = Path(__file__).parent / "exports" / f"predictions_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        
+        print(f"✓ 预测结果已导出到: {output_path}")
+        return str(output_path)
+    
+    def delete_prediction(self, prediction_date: str) -> bool:
+        """
+        删除指定日期的预测结果
+        
+        Args:
+            prediction_date: 预测日期
+        
+        Returns:
+            是否删除成功
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('DELETE FROM predictions WHERE prediction_date = ?', (prediction_date,))
+            
+            if cursor.rowcount > 0:
+                print(f"✓ 已删除预测结果: {prediction_date}")
+            else:
+                print(f"⚠ 未找到预测结果: {prediction_date}")
+            
+            conn.commit()
+            conn.close()
+            return True
+            
+        except Exception as e:
+            print(f"✗ 删除失败: {e}")
+            return False
+    
+    def get_statistics(self) -> Dict:
+        """获取数据库统计信息"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        # 总记录数
+        cursor.execute('SELECT COUNT(*) FROM predictions')
+        total_count = cursor.fetchone()[0]
+
+        # 最新预测日期
+        cursor.execute('SELECT MAX(prediction_date) FROM predictions')
+        latest_date = cursor.fetchone()[0]
+
+        # 最早预测日期
+        cursor.execute('SELECT MIN(prediction_date) FROM predictions')
+        earliest_date = cursor.fetchone()[0]
+
+        # 平均置信度
+        cursor.execute('SELECT AVG(confidence) FROM predictions WHERE confidence IS NOT NULL')
+        avg_confidence = cursor.fetchone()[0]
+
+        # 平均准确率（从模型性能表中获取）
+        cursor.execute('SELECT AVG(accuracy) FROM model_performance WHERE accuracy IS NOT NULL')
+        avg_accuracy = cursor.fetchone()[0]
+
+        conn.close()
+
+        return {
+            'total_predictions': total_count,
+            'latest_date': latest_date,
+            'earliest_date': earliest_date,
+            'avg_confidence': avg_confidence,
+            'avg_accuracy': avg_accuracy
+        }
+    
+    def save_enhanced_prediction(self, result: Dict) -> bool:
+        """
+        保存增强预测结果
+        
+        Args:
+            result: 增强预测结果字典
+        
+        Returns:
+            bool: 是否保存成功
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            # 解析数据
+            prediction_date = result['prediction_date'].strftime('%Y-%m-%d')
+            run_time = result['prediction_date'].strftime('%Y-%m-%d %H:%M:%S')
+            current_price = result['current_price']
+            
+            final = result['final_prediction']
+            final_price = final['price']
+            final_return = final['return_pct']
+            
+            # 检查是否已存在
+            cursor.execute('SELECT id FROM predictions WHERE prediction_date = ?', (prediction_date,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                # 更新现有记录
+                print(f"✓ 更新增强预测结果: {prediction_date}")
+                cursor.execute('''
+                    UPDATE predictions SET
+                        run_time = ?,
+                        current_price = ?,
+                        xgboost_5day = ?,
+                        macro_1month = ?,
+                        fundamental_6month = ?,
+                        overall_trend = ?,
+                        confidence = ?,
+                        risk_level = ?,
+                        notes = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE prediction_date = ?
+                ''', (
+                    run_time,
+                    current_price,
+                    result['predictions']['xgboost']['price'],
+                    result['predictions']['macro']['price'],
+                    result['predictions']['fundamental']['price'],
+                    'up' if final_return > 0 else ('down' if final_return < 0 else 'neutral'),
+                    0.8 if result['confidence_level'] == 'high' else (0.5 if result['confidence_level'] == 'medium' else 0.3),
+                    result['market_state'],
+                    f"Enhanced prediction. Market state: {result['market_state']}, Confidence: {result['confidence_level']}",
+                    prediction_date
+                ))
+            else:
+                # 插入新记录
+                print(f"✓ 保存增强预测结果: {prediction_date}")
+                cursor.execute('''
+                    INSERT INTO predictions (
+                        prediction_date, run_time, current_price,
+                        xgboost_5day, macro_1month, fundamental_6month,
+                        overall_trend, confidence, risk_level, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    prediction_date,
+                    run_time,
+                    current_price,
+                    result['predictions']['xgboost']['price'],
+                    result['predictions']['macro']['price'],
+                    result['predictions']['fundamental']['price'],
+                    'up' if final_return > 0 else ('down' if final_return < 0 else 'neutral'),
+                    0.8 if result['confidence_level'] == 'high' else (0.5 if result['confidence_level'] == 'medium' else 0.3),
+                    result['market_state'],
+                    f"Enhanced prediction. Market state: {result['market_state']}, Confidence: {result['confidence_level']}"
+                ))
+            
+            # 保存增强数据到详情表
+            enhanced_data = result.get('enhanced_data', {})
+            
+            # 保存宏观数据
+            macro = enhanced_data.get('macro', {})
+            cursor.execute('''
+                INSERT OR REPLACE INTO macro_factors (
+                    prediction_date, usd_index, vix, china_pmi
+                ) VALUES (?, ?, ?, ?)
+            ''', (
+                prediction_date,
+                macro.get('dollar_index', {}).get('value'),
+                macro.get('vix', {}).get('value'),
+                macro.get('pmi', {}).get('value')
+            ))
+            
+            # 保存完整预测详情到JSON
+            cursor.execute('''
+                INSERT OR REPLACE INTO prediction_details (
+                    prediction_date, detail_type, detail_json
+                ) VALUES (?, ?, ?)
+            ''', (
+                prediction_date,
+                'enhanced',
+                json.dumps(result, default=str, ensure_ascii=False)
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            return True
+            
+        except Exception as e:
+            print(f"✗ 保存增强预测失败: {e}")
+            return False
+
+
+# 便捷函数
+def get_prediction_db() -> PredictionDatabase:
+    """获取预测数据库实例"""
+    return PredictionDatabase()
+
+
+if __name__ == "__main__":
+    # 测试代码
+    print("=" * 60)
+    print("预测数据库模块")
+    print("=" * 60)
+    
+    db = get_prediction_db()
+    
+    # 显示统计信息
+    print("\n数据库统计:")
+    stats = db.get_statistics()
+    for key, value in stats.items():
+        print(f"  {key}: {value}")
+    
+    # 显示最新预测
+    print("\n最新预测:")
+    latest = db.get_latest_prediction()
+    if latest:
+        print(f"  日期: {latest['prediction_date']}")
+        print(f"  当前价格: {latest.get('current_price')}")
+        print(f"  XGBoost 5天预测: {latest.get('xgboost_5day')}")
+    else:
+        print("  暂无预测数据")
