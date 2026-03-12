@@ -1802,7 +1802,8 @@ HTML_TEMPLATE = """
                 await displayPredictionResults(modelType);
 
                 // 显示置信度面板（始终显示，如果没有验证数据则显示默认值）
-                await displayConfidence(modelType);
+                // 如果运行了验证，强制刷新验证结果
+                await displayConfidence(modelType, runValidation);
 
                 // 重新启用所有按钮
                 buttons.forEach(btn => btn.disabled = false);
@@ -2549,9 +2550,11 @@ HTML_TEMPLATE = """
         }
 
         // 显示置信度面板
-        async function displayConfidence(modelType) {
+        async function displayConfidence(modelType, forceRefresh = false) {
             try {
-                const response = await fetch('/validation-results');
+                // 添加时间戳参数绕过缓存
+                const timestamp = new Date().getTime();
+                const response = await fetch(`/validation-results?t=${timestamp}`);
                 const results = await response.json();
 
                 // 映射 demo 到对应的实际模型
@@ -4235,6 +4238,7 @@ def list_reports():
 def get_validation_results():
     """获取模型验证结果（置信度数据）"""
     import re
+    global validation_results_cache
 
     results = {
         'xgboost': {},
@@ -4242,7 +4246,20 @@ def get_validation_results():
         'fundamental': {}
     }
 
-    # 查找最新的验证报告
+    # 检查是否有时间戳参数（用于绕过缓存）
+    bypass_cache = request.args.get('t') is not None
+
+    # 首先检查缓存中是否有最近的验证结果
+    if not bypass_cache and validation_results_cache['timestamp'] is not None:
+        cache_age = datetime.now() - validation_results_cache['timestamp']
+        if cache_age.total_seconds() < 300:  # 缓存5分钟
+            print(f"使用缓存的验证结果 (缓存时间: {cache_age.total_seconds():.0f}秒)")
+            for model_type in results.keys():
+                if validation_results_cache[model_type]:
+                    results[model_type] = validation_results_cache[model_type]
+            return jsonify(results)
+
+    # 查找最新的验证报告文件
     for model_type in results.keys():
         validation_files = list(Path('.').glob(f'validation_report_{model_type}_*.txt'))
 
@@ -4355,6 +4372,13 @@ def get_validation_results():
             except Exception as e:
                 print(f"解析验证报告失败: {e}")
                 continue
+
+    # 将结果缓存到全局变量
+    for model_type in results.keys():
+        if results[model_type]:
+            validation_results_cache[model_type] = results[model_type]
+    validation_results_cache['timestamp'] = datetime.now()
+    print(f"验证结果已缓存，时间戳: {validation_results_cache['timestamp']}")
 
     return jsonify(results)
 
@@ -5646,6 +5670,14 @@ def get_futures_quotes():
 tavily_news_cache = {
     'copper': {'data': None, 'timestamp': None},
     'cache_duration': timedelta(minutes=2)  # 缓存2分钟，保证新闻实时性
+}
+
+# 验证结果缓存
+validation_results_cache = {
+    'xgboost': None,
+    'macro': None,
+    'fundamental': None,
+    'timestamp': None
 }
 
 
