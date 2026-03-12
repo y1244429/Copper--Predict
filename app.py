@@ -4294,7 +4294,7 @@ def get_validation_results():
                     data['position_size'] = float(position_match.group(1))
 
                 # 尝试解析真实的R²和方向准确率
-                r2_match = re.search(r'R[²2]:\s*([\d.]+)', content)
+                r2_match = re.search(r'R[²2].*?(-?[\d.]+)', content)
                 dir_acc_match = re.search(r'方向准确率:\s*([\d.]+)%', content)
 
                 # 默认值（如果没有真实数据）
